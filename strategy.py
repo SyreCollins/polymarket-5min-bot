@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections import deque
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from math import erf, exp, isfinite, log, sqrt
@@ -354,6 +356,119 @@ class RiskManager:
     consecutive_losses: int = 0
     _entry_times: deque[float] = field(default_factory=deque, repr=False)
     _day: str | None = field(default=None, repr=False)
+    state_path: str | Path | None = field(default=None, repr=False, compare=False)
+    day_changed_on_load: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.state_path is None:
+            return
+        path = Path(self.state_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path = path
+        today = datetime.fromtimestamp(self.clock(), tz=timezone.utc).date().isoformat()
+        with closing(self._connect_state()) as connection, connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS daily_risk_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    utc_date TEXT NOT NULL,
+                    trades_today INTEGER NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS order_attempts (
+                    market_id TEXT PRIMARY KEY,
+                    end_ts REAL NOT NULL,
+                    attempted_at REAL NOT NULL,
+                    status TEXT NOT NULL
+                )"""
+            )
+            row = connection.execute(
+                "SELECT utc_date, trades_today FROM daily_risk_state WHERE singleton = 1"
+            ).fetchone()
+            self.day_changed_on_load = bool(row and row[0] != today)
+            self._day = today
+            self.trades_today = int(row[1]) if row and row[0] == today else 0
+            self._save_daily_count(connection)
+            cutoff = self.clock() - 3600.0
+            self._entry_times = deque(
+                float(item[0])
+                for item in connection.execute(
+                    "SELECT attempted_at FROM order_attempts WHERE attempted_at > ? AND status != 'not_filled' ORDER BY attempted_at",
+                    (cutoff,),
+                )
+            )
+
+    def _connect_state(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.state_path, timeout=10.0)
+
+    def _save_daily_count(self, connection: sqlite3.Connection) -> None:
+        if self._day is None:
+            return
+        connection.execute(
+            """INSERT INTO daily_risk_state (singleton, utc_date, trades_today)
+               VALUES (1, ?, ?)
+               ON CONFLICT(singleton) DO UPDATE SET
+                   utc_date = excluded.utc_date,
+                   trades_today = excluded.trades_today""",
+            (self._day, self.trades_today),
+        )
+
+    def reserve_order_attempt(self, market_id: str, end_ts: float) -> bool:
+        self._roll_day()
+        now = self.clock()
+        if self.state_path is None:
+            self.trades_today += 1
+            self._entry_times.append(now)
+            return True
+        with closing(self._connect_state()) as connection, connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO order_attempts (market_id, end_ts, attempted_at, status) VALUES (?, ?, ?, 'pending')",
+                (market_id, end_ts, now),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self.trades_today += 1
+            self._entry_times.append(now)
+            self._save_daily_count(connection)
+            connection.execute("DELETE FROM order_attempts WHERE end_ts < ?", (now - 30 * 86400,))
+            return True
+
+    def active_order_attempts(self) -> dict[str, float]:
+        if self.state_path is None:
+            return {}
+        now = self.clock()
+        with closing(self._connect_state()) as connection:
+            rows = connection.execute(
+                "SELECT market_id, end_ts FROM order_attempts WHERE end_ts >= ?",
+                (now - 3600.0,),
+            ).fetchall()
+        return {str(market_id): float(end_ts) for market_id, end_ts in rows}
+
+    def update_order_attempt(self, market_id: str, status: str) -> None:
+        if self.state_path is None:
+            return
+        with closing(self._connect_state()) as connection, connection:
+            row = connection.execute(
+                "SELECT attempted_at FROM order_attempts WHERE market_id = ?",
+                (market_id,),
+            ).fetchone()
+            connection.execute(
+                "UPDATE order_attempts SET status = ? WHERE market_id = ?",
+                (status, market_id),
+            )
+            if status == "not_filled" and row is not None and self._day is not None:
+                current = connection.execute(
+                    "SELECT utc_date, trades_today FROM daily_risk_state WHERE singleton = 1"
+                ).fetchone()
+                if current is not None and current[0] == self._day:
+                    self.trades_today = max(0, int(current[1]) - 1)
+                    self._save_daily_count(connection)
+                attempted_at = float(row[0])
+                self._entry_times = deque(timestamp for timestamp in self._entry_times if timestamp != attempted_at)
+
+    def record_filled_position(self) -> None:
+        self._roll_day()
+        self.open_positions += 1
 
     @property
     def daily_loss(self) -> float:
@@ -395,6 +510,7 @@ class RiskManager:
         self.trades_today += 1
         self.open_positions += 1
         self._entry_times.append(self.clock())
+        self._persist_daily_count()
 
     def record_result(self, pnl: float) -> None:
         self._roll_day()
@@ -415,6 +531,20 @@ class RiskManager:
             self.daily_pnl = 0.0
             self.trades_today = 0
             self.consecutive_losses = 0
+            self._persist_daily_count()
+
+    def _persist_daily_count(self) -> None:
+        if self.state_path is None:
+            return
+        with closing(self._connect_state()) as connection, connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS daily_risk_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    utc_date TEXT NOT NULL,
+                    trades_today INTEGER NOT NULL
+                )"""
+            )
+            self._save_daily_count(connection)
 
 
 def normal_cdf(x: float) -> float:

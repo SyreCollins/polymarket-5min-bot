@@ -4,13 +4,16 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import isfinite
 from statistics import median
-from time import time
+from time import monotonic, time
 from typing import Callable
+import urllib.parse
+import urllib.request
 from zoneinfo import ZoneInfo
 
 import websockets
@@ -33,6 +36,60 @@ HISTORY_RETENTION_SECONDS = 900.0
 RESOLUTION_GRACE_SECONDS = 15.0
 RESOLUTION_RETRY_SECONDS = 10.0
 RESOLUTION_SLOW_RETRY_SECONDS = 60.0
+GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
+GEOBLOCK_INTERVAL_SECONDS = 2 * 60 * 60
+TELEGRAM_POLL_TIMEOUT_SECONDS = 2
+TELEGRAM_REQUEST_TIMEOUT_SECONDS = 5
+TELEGRAM_HEARTBEAT_SECONDS = 60 * 60
+
+
+def check_geoblock() -> tuple[bool, str]:
+    request = urllib.request.Request(GEOBLOCK_URL, headers={"accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("blocked"), bool):
+        raise ValueError("invalid geoblock response")
+    country = str(payload.get("country") or "unknown")
+    return payload["blocked"], country
+
+
+def send_telegram_alert(message: str) -> bool:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        log.error("[telegram] alert not sent: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    body = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        return isinstance(result, dict) and result.get("ok") is True
+    except Exception as exc:
+        log.warning("[telegram] alert delivery failed (%s)", type(exc).__name__)
+        return False
+
+
+def fetch_telegram_updates(offset: int) -> list[dict] | None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return None
+    query = urllib.parse.urlencode({
+        "offset": offset,
+        "timeout": TELEGRAM_POLL_TIMEOUT_SECONDS,
+        "allowed_updates": json.dumps(["message"]),
+    })
+    url = f"https://api.telegram.org/bot{token}/getUpdates?{query}"
+    request = urllib.request.Request(url, headers={"accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=TELEGRAM_REQUEST_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        result = payload.get("result") if isinstance(payload, dict) and payload.get("ok") is True else None
+        return result if isinstance(result, list) else None
+    except Exception as exc:
+        log.warning("[telegram] command polling failed (%s)", type(exc).__name__)
+        return None
 
 
 @dataclass
@@ -399,33 +456,153 @@ class TradingBot:
             signature_type=settings.signature_type,
         )
         self.logger = logger or TradeLogger(settings.trade_log_path)
-        self.risk_manager = RiskManager(settings.risk, clock=clock)
+        self.risk_manager = RiskManager(settings.risk, clock=clock, state_path=settings.risk_state_path)
         self.ledger = PaperTradeLedger()
         self.feature_engine = FeatureEngine()
         self.market: Market | None = None
         self.next_market_refresh = 0.0
         # market id -> end_ts; a market is never retried once an order was attempted.
-        self.attempted_markets: dict[str, float] = {}
+        self.attempted_markets = self.risk_manager.active_order_attempts()
         self.open_prices: dict[tuple[str, str], float] = {}
         self.open_price_warned: set[str] = set()
         self.next_resolution_check: dict[str, float] = {}
+        self.geoblock_blocked: bool | None = None
+        self.geoblock_country = "unknown"
+        self.next_geoblock_check = 0.0
+        self.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        self.telegram_offset = 0
+        self.telegram_stopped = False
+        self.telegram_outbox: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
+        self._last_alerted_risk = ""
+        self._last_error_alert_at = 0.0
+        self._next_heartbeat = monotonic() + TELEGRAM_HEARTBEAT_SECONDS
 
     async def run(self) -> None:
-        await asyncio.to_thread(self.executor.ensure_ready)
-        mode = "DRY-RUN (paper)" if self.settings.dry_run else "LIVE"
-        log.info("[startup] mode=%s stake=%.2f USDC", mode, self.settings.stake_usdc)
+        sender_task = asyncio.create_task(self.telegram_sender_loop(), name="telegram-sender")
+        command_task = asyncio.create_task(self.telegram_command_loop(), name="telegram-commands")
+        mode = "DRY RUN" if self.settings.dry_run else "LIVE"
+        self.notify(f"Bot started ({mode}); daily trades={self.risk_manager.trades_today}.")
+        if self.risk_manager.day_changed_on_load:
+            self.notify("Daily UTC trade counter reset after the date changed.")
+        startup_backoff = 1.0
+        try:
+            await self.check_geoblock_status(force=True)
+            while True:
+                try:
+                    await asyncio.to_thread(self.executor.ensure_ready)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error("[startup] exchange authentication failed (%s); retrying in %.1fs", type(exc).__name__, startup_backoff)
+                    self.notify_error(f"Exchange authentication failed ({type(exc).__name__}); retrying.")
+                    await asyncio.sleep(startup_backoff)
+                    startup_backoff = min(60.0, startup_backoff * 2)
+            log.info("[startup] mode=%s stake=%.2f USDC", mode, self.settings.stake_usdc)
+            while True:
+                try:
+                    await self.step()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.exception("[loop] unexpected error")
+                    self.notify_error(f"Trading cycle failed ({type(exc).__name__}).")
+                if monotonic() >= self._next_heartbeat:
+                    status = "paused" if self.telegram_stopped or self.geoblock_blocked is not False else "running"
+                    self.notify(f"Heartbeat: {status}; daily trades={self.risk_manager.trades_today}.")
+                    self._next_heartbeat = monotonic() + TELEGRAM_HEARTBEAT_SECONDS
+                await asyncio.sleep(self.settings.poll_seconds)
+        finally:
+            for task in (command_task, sender_task):
+                task.cancel()
+            await asyncio.gather(command_task, sender_task, return_exceptions=True)
+            shutdown_prefix = "[DRY RUN] " if self.settings.dry_run else ""
+            await asyncio.to_thread(send_telegram_alert, shutdown_prefix + "Bot is shutting down.")
+
+    def notify(self, message: str) -> None:
+        prefix = "[DRY RUN] " if self.settings.dry_run else ""
+        try:
+            self.telegram_outbox.put_nowait(prefix + message)
+        except asyncio.QueueFull:
+            log.warning("[telegram] alert queue full; dropping notification")
+
+    def notify_once(self, key: str, message: str) -> None:
+        if key != self._last_alerted_risk:
+            self._last_alerted_risk = key
+            self.notify(message)
+
+    def notify_error(self, message: str) -> None:
+        now = monotonic()
+        if now - self._last_error_alert_at >= 60.0:
+            self._last_error_alert_at = now
+            self.notify(message)
+
+    async def telegram_sender_loop(self) -> None:
         while True:
+            message = await self.telegram_outbox.get()
             try:
-                await self.step()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("[loop] unexpected error")
-            await asyncio.sleep(self.settings.poll_seconds)
+                await asyncio.to_thread(send_telegram_alert, message)
+            finally:
+                self.telegram_outbox.task_done()
+
+    async def telegram_command_loop(self) -> None:
+        while True:
+            if not self.telegram_chat_id or not os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
+                await asyncio.sleep(30.0)
+                continue
+            updates = await asyncio.to_thread(fetch_telegram_updates, self.telegram_offset)
+            if updates is None:
+                await asyncio.sleep(5.0)
+                continue
+            self.process_telegram_updates(updates)
+
+    def process_telegram_updates(self, updates: list[dict]) -> None:
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            update_id = update.get("update_id")
+            if isinstance(update_id, int):
+                self.telegram_offset = max(self.telegram_offset, update_id + 1)
+            message = update.get("message")
+            if not isinstance(message, dict):
+                continue
+            chat = message.get("chat") or {}
+            sender = message.get("from") or {}
+            if str(chat.get("id", "")) != self.telegram_chat_id:
+                continue
+            if str(sender.get("id", "")) != self.telegram_chat_id:
+                continue
+            words = str(message.get("text", "")).strip().split()
+            command = words[0].split("@", 1)[0].lower() if words else ""
+            if command == "/stop":
+                self.telegram_stopped = True
+                self.notify("Telegram stop command accepted; new orders are paused.")
+            elif command == "/resume":
+                if self.settings.risk.kill_switch:
+                    self.notify("Cannot resume: KILL_SWITCH is enabled in configuration.")
+                else:
+                    self.telegram_stopped = False
+                    self.notify("Telegram resume command accepted; trading resumes when other safety checks allow.")
+            elif command == "/status":
+                status = "paused" if self.telegram_stopped or self.geoblock_blocked is not False else "running"
+                self.notify(f"Bot status: {status}; daily trades={self.risk_manager.trades_today}.")
 
     async def step(self) -> None:
         now = self.clock()
+        previous_day = self.risk_manager._day
+        risk_block = self.risk_manager.block_reason()
+        if previous_day is not None and self.risk_manager._day != previous_day:
+            self._last_alerted_risk = ""
+            self.notify("Daily UTC risk limits reset; trading may resume.")
+        if risk_block:
+            key = "daily-cap" if "daily trade limit" in risk_block else risk_block
+            self.notify_once(key, f"Risk limit: {risk_block}.")
+        else:
+            self._last_alerted_risk = ""
+        await self.check_geoblock_status()
         await self.resolve_positions(now)
+        if self.telegram_stopped or self.geoblock_blocked is not False:
+            return
         market = await self.current_market(now)
         if market is None:
             return
@@ -437,7 +614,9 @@ class TradingBot:
         btc = self.state.get_current_btc_state(now=now)
         if btc.status != "OK" or btc.price is None or btc.primary_source is None:
             log.warning("[decision] %s: %s; new trades disabled", btc.status, btc.reason)
+            self.notify_once(f"feed-{btc.status}", f"Price feed unavailable ({btc.status}); new trades are paused.")
             return
+        self._last_alerted_risk = ""
 
         source = btc.primary_source
         open_price = self.open_price(market, source, start_ts)
@@ -456,6 +635,8 @@ class TradingBot:
             asyncio.to_thread(self.clob.quote, market.up.token_id, stake),
             asyncio.to_thread(self.clob.quote, market.down.token_id, stake),
         )
+        if up_quote is None or down_quote is None:
+            self.notify_error("Polymarket order-book quote unavailable; affected trades are skipped.")
         seconds_left = market.end_ts - self.clock()
         up_ask = up_quote.best_ask if up_quote else None
         down_ask = down_quote.best_ask if down_quote else None
@@ -493,6 +674,29 @@ class TradingBot:
 
         if signal.should_trade and market.id not in self.attempted_markets:
             await self.execute(market, signal, side_quote, stake)
+        elif signal.reason == "daily trade limit reached":
+            self.notify_once("daily-cap", "Daily trade cap reached; trading is paused until the next UTC day.")
+
+    async def check_geoblock_status(self, *, force: bool = False) -> None:
+        now = monotonic()
+        if not force and now < self.next_geoblock_check:
+            return
+        self.next_geoblock_check = now + GEOBLOCK_INTERVAL_SECONDS
+        previous = self.geoblock_blocked
+        try:
+            blocked, country = await asyncio.to_thread(check_geoblock)
+            self.geoblock_blocked = blocked
+            self.geoblock_country = country
+        except Exception as exc:
+            self.geoblock_blocked = None
+            log.error("[geoblock] check failed (%s); new trades paused", type(exc).__name__)
+            self.notify_error("Polymarket geoblock check failed; trading is paused.")
+            return
+
+        if self.geoblock_blocked and previous is not True:
+            self.notify(f"Polymarket geoblock blocked this connection (country: {self.geoblock_country}); new trades are paused.")
+        elif previous is True and not self.geoblock_blocked:
+            self.notify("Polymarket geoblock is clear; trading has resumed.")
 
     async def current_market(self, now: float) -> Market | None:
         previous = self.market
@@ -503,6 +707,7 @@ class TradingBot:
                 markets = await asyncio.to_thread(self.gamma.find_btc_5m_markets)
             except Exception as exc:
                 log.warning("[scan] market discovery failed: %s", exc)
+                self.notify_error(f"Market discovery failed ({type(exc).__name__}).")
                 markets = None
             if markets is not None:
                 self.market = choose_current_market(markets, now)
@@ -536,15 +741,25 @@ class TradingBot:
         blocked = self.risk_manager.block_reason(spread=spread, liquidity=market.liquidity)
         if blocked:
             log.info("[risk] skipping %s %s: %s", market.slug or market.id, signal.outcome, blocked)
+            key = "daily-cap" if "daily trade limit" in blocked else blocked
+            self.notify_once(key, f"Risk limit: {blocked}.")
             return
 
-        # Mark before sending: a timeout may still have filled, so never re-send for this market.
+        if self.telegram_stopped or self.geoblock_blocked is not False:
+            return
+
+        # Persist the intent before sending so a restart cannot repeat an ambiguous order.
+        if not self.risk_manager.reserve_order_attempt(market.id, market.end_ts):
+            self.attempted_markets[market.id] = market.end_ts
+            return
         self.attempted_markets[market.id] = market.end_ts
         try:
             result = await asyncio.to_thread(self.executor.buy_market, signal.token_id, stake, signal.limit_price)
         except Exception as exc:
-            log.exception("[trade] order failed for %s", market.id)
-            self.logger.record_event("order_error", market_id=market.id, outcome=signal.outcome, error=str(exc))
+            self.risk_manager.update_order_attempt(market.id, "unknown")
+            log.error("[trade] order failed for %s (%s)", market.id, type(exc).__name__)
+            self.logger.record_event("order_error", market_id=market.id, outcome=signal.outcome, error=type(exc).__name__)
+            self.notify_error(f"Order outcome is unknown for market {market.id}; no retry will be made.")
             return
 
         self.logger.record_event(
@@ -556,11 +771,12 @@ class TradingBot:
             expected_fill=signal.fill_price,
             dry_run=self.settings.dry_run,
             filled=result.filled,
-            error=result.error,
-            response=result.raw,
+            error_code="none" if result.filled else "order_not_filled",
         )
+        self.risk_manager.update_order_attempt(market.id, "filled" if result.filled else "not_filled")
         if not result.filled:
-            log.warning("[trade] %s order not filled: %s", signal.outcome, result.error)
+            log.warning("[trade] %s order not filled", signal.outcome)
+            self.notify(f"Order not filled for market {market.id}.")
             return
 
         expected_fill = signal.fill_price or signal.ask_price
@@ -576,11 +792,14 @@ class TradingBot:
             shares=shares,
             end_ts=market.end_ts,
         )
-        self.risk_manager.record_entry()
+        self.risk_manager.record_filled_position()
         log.info(
             "[trade] %s%s %.2f USDC for %.2f shares (avg %.3f, limit %s, p=%.3f)",
             "PAPER " if self.settings.dry_run else "",
             signal.outcome, cost, shares, cost / shares, fmt(signal.limit_price), signal.model_probability,
+        )
+        self.notify(
+            f"Trade {signal.outcome}: {cost:.2f} USDC, {shares:.2f} shares, average price {cost / shares:.3f}."
         )
 
     async def resolve_positions(self, now: float) -> None:
@@ -599,6 +818,7 @@ class TradingBot:
                 winner = await asyncio.to_thread(self.gamma.fetch_resolution, trade.market_id)
             except Exception as exc:
                 log.warning("[result] resolution lookup failed for %s: %s", trade.market_id, exc)
+                self.notify_error(f"Market resolution lookup failed ({type(exc).__name__}).")
                 continue
             if winner is None:
                 if slow:
@@ -715,7 +935,18 @@ async def main() -> None:
         )
         for feed in build_feeds(settings)
     ]
-    await asyncio.gather(*feeds, TradingBot(settings, state).run())
+    main_task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    try:
+        if main_task is not None:
+            loop.add_signal_handler(signal.SIGTERM, main_task.cancel)
+    except (NotImplementedError, RuntimeError):
+        log.warning("[shutdown] SIGTERM handler unavailable on this platform")
+
+    try:
+        await asyncio.gather(*feeds, TradingBot(settings, state).run())
+    except asyncio.CancelledError:
+        log.info("[shutdown] SIGTERM received; stopping feeds and trading loop")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,12 @@
 import asyncio
+import os
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from time import monotonic
+from unittest.mock import Mock, patch
 
 from btc_5m_bot import PriceState, TradingBot
 from polymarket_client import (
@@ -176,6 +179,46 @@ class RiskManagerTests(unittest.TestCase):
             self.manager.record_entry()
         self.assertEqual(self.manager.block_reason(), "max open positions reached")
 
+    def test_daily_count_and_order_intent_survive_restart_and_utc_reset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2026, 9, 28, 23, 59, 50, tzinfo=timezone.utc).timestamp()
+            db_path = Path(temp_dir) / "state.db"
+            manager = RiskManager(
+                RiskConfig(max_trades_per_day=1),
+                clock=lambda: now,
+                state_path=db_path,
+            )
+            self.assertTrue(manager.reserve_order_attempt("market-1", now + 300))
+
+            restarted = RiskManager(
+                RiskConfig(max_trades_per_day=1),
+                clock=lambda: now,
+                state_path=db_path,
+            )
+            self.assertEqual(restarted.trades_today, 1)
+            self.assertEqual(restarted.active_order_attempts(), {"market-1": now + 300})
+            self.assertFalse(restarted.reserve_order_attempt("market-1", now + 300))
+
+            now += 10
+            next_day = RiskManager(
+                RiskConfig(max_trades_per_day=1),
+                clock=lambda: now,
+                state_path=db_path,
+            )
+            self.assertEqual(next_day.trades_today, 0)
+            self.assertTrue(next_day.day_changed_on_load)
+
+    def test_rejected_order_does_not_consume_daily_trade_cap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RiskManager(
+                RiskConfig(max_trades_per_day=1),
+                clock=lambda: self.now,
+                state_path=Path(temp_dir) / "state.db",
+            )
+            self.assertTrue(manager.reserve_order_attempt("market-rejected", self.now + 300))
+            manager.update_order_attempt("market-rejected", "not_filled")
+            self.assertEqual(manager.trades_today, 0)
+
 
 class SettingsTests(unittest.TestCase):
     def test_live_requires_both_switches(self):
@@ -235,7 +278,11 @@ class TradingBotFlowTests(unittest.TestCase):
         executor = FakeExecutor()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        settings = replace(Settings.from_env({}), trade_log_path=str(Path(tmp.name) / "log.jsonl"))
+        settings = replace(
+            Settings.from_env({}),
+            trade_log_path=str(Path(tmp.name) / "log.jsonl"),
+            risk_state_path=str(Path(tmp.name) / "state.db"),
+        )
         bot = TradingBot(
             settings,
             state,
@@ -247,6 +294,8 @@ class TradingBotFlowTests(unittest.TestCase):
             executor=executor,
             clock=lambda: clock["now"],
         )
+        bot.geoblock_blocked = False
+        bot.next_geoblock_check = monotonic() + 7200
 
         asyncio.run(bot.step())
         clock["now"] += 2
@@ -256,6 +305,7 @@ class TradingBotFlowTests(unittest.TestCase):
         self.assertEqual((token, stake), ("up", 5.0))
         self.assertLessEqual(limit, settings.risk.max_buy_price)
         self.assertEqual(bot.risk_manager.open_positions, 1)
+        self.assertTrue(any("Trade UP" in bot.telegram_outbox.get_nowait() for _ in range(bot.telegram_outbox.qsize())))
 
         clock["now"] = end + 20
         asyncio.run(bot.resolve_positions(clock["now"]))
@@ -264,6 +314,60 @@ class TradingBotFlowTests(unittest.TestCase):
         self.assertAlmostEqual(trade.pnl, 5.0 / 0.80 - 5.0)
         self.assertEqual(bot.risk_manager.open_positions, 0)
         self.assertAlmostEqual(bot.risk_manager.daily_pnl, trade.pnl)
+
+
+class GeoBlockTests(unittest.TestCase):
+    def test_blocked_pauses_and_false_resumes_with_country_alert(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = replace(Settings.from_env({}), risk_state_path=str(Path(temp_dir) / "state.db"))
+            bot = TradingBot(settings, PriceState(), gamma=Mock(), clob=Mock(), executor=Mock())
+        with patch("btc_5m_bot.check_geoblock", return_value=(True, "US")):
+            asyncio.run(bot.check_geoblock_status(force=True))
+        self.assertTrue(bot.geoblock_blocked)
+        self.assertIn("US", bot.telegram_outbox.get_nowait())
+
+        with patch("btc_5m_bot.check_geoblock", return_value=(False, "US")):
+            asyncio.run(bot.check_geoblock_status(force=True))
+        self.assertFalse(bot.geoblock_blocked)
+        self.assertIn("resumed", bot.telegram_outbox.get_nowait())
+
+
+class TelegramTests(unittest.TestCase):
+    def test_commands_require_configured_chat_and_sender(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "12345"}):
+            settings = replace(Settings.from_env({}), risk_state_path=str(Path(temp_dir) / "state.db"))
+            bot = TradingBot(settings, PriceState(), gamma=Mock(), clob=Mock(), executor=Mock())
+            updates = [
+                {"update_id": 1, "message": {"chat": {"id": 999}, "from": {"id": 999}, "text": "/stop"}},
+                {"update_id": 2, "message": {"chat": {"id": 12345}, "from": {"id": 999}, "text": "/stop"}},
+                {"update_id": 3, "message": {"chat": {"id": 12345}, "from": {"id": 12345}, "text": "/stop"}},
+            ]
+            bot.process_telegram_updates(updates)
+            self.assertTrue(bot.telegram_stopped)
+            self.assertEqual(bot.telegram_offset, 4)
+            self.assertIn("stop command accepted", bot.telegram_outbox.get_nowait())
+            self.assertTrue(bot.telegram_outbox.empty())
+
+            bot.process_telegram_updates([
+                {"update_id": 4, "message": {"chat": {"id": 12345}, "from": {"id": 12345}, "text": "/resume"}}
+            ])
+            self.assertFalse(bot.telegram_stopped)
+
+    def test_telegram_outage_does_not_kill_alert_worker(self):
+        async def exercise_worker():
+            with tempfile.TemporaryDirectory() as temp_dir:
+                settings = replace(Settings.from_env({}), risk_state_path=str(Path(temp_dir) / "state.db"))
+                bot = TradingBot(settings, PriceState(), gamma=Mock(), clob=Mock(), executor=Mock())
+            bot.notify("test alert")
+            worker = asyncio.create_task(bot.telegram_sender_loop())
+            try:
+                await asyncio.wait_for(bot.telegram_outbox.join(), timeout=1.0)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+        with patch("btc_5m_bot.send_telegram_alert", return_value=False):
+            asyncio.run(exercise_worker())
 
 
 if __name__ == "__main__":

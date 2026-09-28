@@ -7,3 +7,7 @@ trade_log.jsonl
 paper_trade_log.jsonl
 paper_final*.jsonl
 test_trade_log.jsonl
+*.pem
+state.db
+state.db-shm
+state.db-wal

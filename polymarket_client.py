@@ -15,6 +15,20 @@ from typing import Any
 
 
 log = logging.getLogger(__name__)
+_clob_timeout_configured = False
+
+
+def _configure_clob_timeout() -> None:
+    global _clob_timeout_configured
+    if _clob_timeout_configured:
+        return
+    from py_clob_client.http_helpers import helpers
+
+    client = getattr(helpers, "_http_client", None)
+    if client is None or not hasattr(client, "timeout"):
+        raise RuntimeError("installed CLOB client does not expose a configurable HTTP timeout")
+    client.timeout = 10.0
+    _clob_timeout_configured = True
 
 WINDOW_SECONDS = 300
 BTC_5M_SLUG_PREFIX = "btc-updown-5m-"
@@ -277,6 +291,7 @@ class ClobMarketData:
     @property
     def client(self):
         if self._client is None:
+            _configure_clob_timeout()
             from py_clob_client.client import ClobClient
 
             self._client = ClobClient(self.host)
@@ -286,7 +301,7 @@ class ClobMarketData:
         try:
             return quote_from_book(self.client.get_order_book(token_id), amount_usdc)
         except Exception as exc:
-            log.warning("order book fetch failed for token %s…: %s", token_id[:12], exc)
+            log.warning("order book fetch failed for token %s… (%s)", token_id[:12], type(exc).__name__)
             return None
 
     def buy_price(self, token_id: str) -> float | None:
@@ -357,6 +372,7 @@ class Executor:
         if not self.private_key:
             raise RuntimeError("POLYMARKET_PRIVATE_KEY is required when dry-run is disabled")
 
+        _configure_clob_timeout()
         from py_clob_client.client import ClobClient
 
         client = ClobClient(

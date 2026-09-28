@@ -59,6 +59,7 @@ class Settings:
     poll_seconds: float = 2.0
     market_refresh_seconds: float = 30.0
     trade_log_path: str = "trade_log.jsonl"
+    risk_state_path: str = "state.db"
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
     private_key: str = ""
@@ -123,6 +124,7 @@ class Settings:
             poll_seconds=e.float("POLL_SECONDS", 2.0),
             market_refresh_seconds=e.float("MARKET_REFRESH_SECONDS", 30.0),
             trade_log_path=e.str("TRADE_LOG_PATH", "trade_log.jsonl"),
+            risk_state_path=e.str("RISK_STATE_PATH", "state.db"),
             gamma_url=e.str("GAMMA_URL", "https://gamma-api.polymarket.com"),
             clob_url=e.str("CLOB_URL", "https://clob.polymarket.com"),
             private_key=e.str("POLYMARKET_PRIVATE_KEY"),
@@ -160,6 +162,8 @@ class Settings:
             errors.append("EXECUTION_COST must be >= 0")
         if self.poll_seconds <= 0:
             errors.append("POLL_SECONDS must be > 0")
+        if not self.risk_state_path.strip():
+            errors.append("RISK_STATE_PATH must not be empty")
         if self.price_max_age_seconds <= 0:
             errors.append("PRICE_MAX_AGE_SECONDS must be > 0")
         if not (self.enable_coinbase or self.enable_okx or self.enable_binance):
