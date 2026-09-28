@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock
 
 from btc_5m_bot import (
@@ -109,7 +111,13 @@ class StrategyImprovementTests(unittest.TestCase):
         state = PriceState()
         state.update_source("coinbase", 65000.0, 100.0, 100.0)
         state.update_source("okx", 65002.0, 101.0, 101.0)
-        self.assertEqual(state.market_open_price(100.0, 66000.0), 65000.0)
+        self.assertEqual(state.market_open_price(100.0), 65000.0)
+        self.assertEqual(state.market_open_price(100.0, source="okx"), 65002.0)
+
+    def test_open_price_is_unknown_without_sample_near_start(self):
+        state = PriceState(max_age_seconds=5.0)
+        state.update_source("binance", 65000.0, 200.0, 200.0)
+        self.assertIsNone(state.market_open_price(100.0))
 
     def test_probability_model_clamps_output(self):
         model = ProbabilityModel()
@@ -174,12 +182,11 @@ class StrategyImprovementTests(unittest.TestCase):
         self.assertFalse(signal.should_trade)
         self.assertEqual(signal.reason, "insufficient BTC price history")
 
-    def test_risk_manager_blocks_daily_loss_limit(self):
+    def test_risk_manager_blocks_hourly_trade_limit(self):
         risk = RiskConfig(
             max_daily_loss=10.0,
             max_position_size=25.0,
             min_edge=0.08,
-            max_trade_size=5.0,
             max_trades_per_hour=3,
         )
         manager = RiskManager(risk)
@@ -188,9 +195,12 @@ class StrategyImprovementTests(unittest.TestCase):
         manager.record_trade(5.0, "up", 0.55, 0.50, 0.25)
         manager.record_trade(5.0, "up", 0.55, 0.50, 0.25)
         self.assertEqual(manager.can_trade("market-1"), False)
+        self.assertEqual(manager.block_reason(), "hourly trade limit reached")
 
     def test_logger_records_decisions(self):
-        logger = TradeLogger(path="test_trade_log.jsonl")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        logger = TradeLogger(path=Path(tmp.name) / "trade_log.jsonl")
         logger.record_decision(
             timestamp="2026-09-21T00:00:00Z",
             market_id="market-1",
@@ -212,7 +222,6 @@ class StrategyImprovementTests(unittest.TestCase):
             position_size=0.0,
         )
         self.assertTrue(logger.path.exists())
-        logger.path.unlink(missing_ok=True)
 
     def test_paper_trade_ledger_resolves_binary_payout(self):
         ledger = PaperTradeLedger()

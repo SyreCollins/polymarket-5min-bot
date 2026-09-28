@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import re
 import ssl
@@ -8,7 +10,27 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from time import time
 from typing import Any
+
+
+log = logging.getLogger(__name__)
+
+WINDOW_SECONDS = 300
+BTC_5M_SLUG_PREFIX = "btc-updown-5m-"
+
+
+def default_ssl_context() -> ssl.SSLContext:
+    # python.org macOS builds ship without a CA bundle; certifi keeps verification on everywhere.
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def window_start(timestamp: float) -> int:
+    return int(timestamp // WINDOW_SECONDS * WINDOW_SECONDS)
 
 
 @dataclass(frozen=True)
@@ -34,9 +56,25 @@ class Market:
 class GammaClient:
     def __init__(self, base_url: str, ssl_context: ssl.SSLContext | None = None) -> None:
         self.base_url = base_url.rstrip("/")
-        self.ssl_context = ssl_context
+        self.ssl_context = ssl_context or default_ssl_context()
 
-    def find_btc_5m_markets(self, limit: int = 200) -> list[Market]:
+    def find_btc_5m_markets(self, limit: int = 200, now: float | None = None) -> list[Market]:
+        # BTC 5m markets use deterministic slugs, so the current and next window cost two requests.
+        now = time() if now is None else now
+        by_slug: list[Market] = []
+        for start in (window_start(now), window_start(now) + WINDOW_SECONDS):
+            try:
+                market = self.find_market_by_slug(f"{BTC_5M_SLUG_PREFIX}{start}")
+            except (OSError, ValueError) as exc:
+                log.warning("gamma slug lookup failed for window %s: %s", start, exc)
+                continue
+            if market and market_matches_btc_5m(market, require_strict_match=True):
+                by_slug.append(market)
+        if by_slug:
+            return sorted(by_slug, key=lambda market: market.end_ts)
+        return self.scan_btc_5m_markets(limit)
+
+    def scan_btc_5m_markets(self, limit: int = 200) -> list[Market]:
         markets_by_id: dict[str, Market] = {}
         for market in self._find_btc_5m_from_keyset(limit):
             markets_by_id.setdefault(market.id or market.slug, market)
@@ -147,14 +185,88 @@ class GammaClient:
                     break
         return found
 
-    def _get_json(self, path: str, params: dict[str, str]) -> Any:
-        query = urllib.parse.urlencode(params)
+    def find_market_by_slug(self, slug: str) -> Market | None:
+        payload = self._get_json("/markets", {"slug": slug})
+        items = payload.get("data", []) if isinstance(payload, dict) else payload
+        for item in items or []:
+            if isinstance(item, dict):
+                market = parse_market(item)
+                if market:
+                    return market
+        return None
+
+    def fetch_resolution(self, market_id: str) -> str | None:
+        """Return "UP"/"DOWN" once the market has resolved, else None."""
+        payload = self._get_json(f"/markets/{urllib.parse.quote(market_id, safe='')}")
+        return parse_resolution(payload) if isinstance(payload, dict) else None
+
+    def _get_json(self, path: str, params: dict[str, str] | None = None) -> Any:
+        url = f"{self.base_url}{path}"
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
         request = urllib.request.Request(
-            f"{self.base_url}{path}?{query}",
+            url,
             headers={"accept": "application/json", "user-agent": "btc-5m-bot/0.1"},
         )
         with urllib.request.urlopen(request, timeout=10, context=self.ssl_context) as response:
             return json.loads(response.read().decode("utf-8"))
+
+
+@dataclass(frozen=True)
+class BookQuote:
+    best_ask: float | None
+    best_bid: float | None
+    # Average and worst price to buy the requested USDC amount; None when the book is too thin.
+    avg_fill_price: float | None = None
+    worst_fill_price: float | None = None
+
+    @property
+    def spread(self) -> float | None:
+        if self.best_ask is None or self.best_bid is None:
+            return None
+        return self.best_ask - self.best_bid
+
+
+def _book_levels(levels: Any) -> list[tuple[float, float]]:
+    parsed: list[tuple[float, float]] = []
+    if not isinstance(levels, (list, tuple)):
+        return parsed
+    for level in levels:
+        price = getattr(level, "price", None)
+        size = getattr(level, "size", None)
+        if isinstance(level, dict):
+            price = level.get("price", price)
+            size = level.get("size", size)
+        if price is None:
+            continue
+        try:
+            parsed.append((float(price), float(size) if size is not None else 0.0))
+        except (TypeError, ValueError):
+            continue
+    return parsed
+
+
+def quote_from_book(book: Any, amount_usdc: float) -> BookQuote:
+    asks = sorted(_book_levels(getattr(book, "asks", None)))
+    bids = _book_levels(getattr(book, "bids", None))
+    best_ask = asks[0][0] if asks else None
+    best_bid = max((price for price, _ in bids), default=None)
+
+    remaining = amount_usdc
+    shares = 0.0
+    worst = None
+    for price, size in asks:
+        if remaining <= 1e-9:
+            break
+        if price <= 0 or size <= 0:
+            continue
+        spend = min(remaining, price * size)
+        shares += spend / price
+        remaining -= spend
+        worst = price
+    if amount_usdc <= 0 or remaining > 1e-9 or shares <= 0:
+        return BookQuote(best_ask, best_bid)
+    return BookQuote(best_ask, best_bid, amount_usdc / shares, worst)
 
 
 class ClobMarketData:
@@ -170,60 +282,92 @@ class ClobMarketData:
             self._client = ClobClient(self.host)
         return self._client
 
-    def buy_price(self, token_id: str) -> float | None:
+    def quote(self, token_id: str, amount_usdc: float) -> BookQuote | None:
         try:
-            book = self.client.get_order_book(token_id)
-            asks = getattr(book, "asks", None) or []
-            prices = []
-            for level in asks:
-                value = getattr(level, "price", None)
-                if value is None and isinstance(level, dict):
-                    value = level.get("price")
-                if value is not None:
-                    prices.append(float(value))
-            return min(prices) if prices else None
-        except Exception:
+            return quote_from_book(self.client.get_order_book(token_id), amount_usdc)
+        except Exception as exc:
+            log.warning("order book fetch failed for token %s…: %s", token_id[:12], exc)
             return None
+
+    def buy_price(self, token_id: str) -> float | None:
+        quote = self.quote(token_id, 0.0)
+        return quote.best_ask if quote else None
+
+
+@dataclass(frozen=True)
+class OrderResult:
+    filled: bool
+    shares: float | None
+    cost_usdc: float | None
+    raw: Any
+    error: str = ""
+
+
+def parse_order_response(response: Any) -> OrderResult:
+    if not isinstance(response, dict):
+        return OrderResult(False, None, None, response, f"unexpected response: {response!r}")
+    error = str(response.get("errorMsg") or response.get("error") or "")
+    status = str(response.get("status") or "").lower()
+    filled = bool(response.get("success")) and not error and status in ("", "matched")
+    # For a BUY, makingAmount is USDC paid and takingAmount is shares received.
+    shares = to_float(response.get("takingAmount")) or None
+    cost = to_float(response.get("makingAmount")) or None
+    return OrderResult(filled, shares, cost, response, error or ("" if filled else f"status={status or 'unknown'}"))
+
+
+def floor_to_tick(price: float, tick: float = 0.01) -> float:
+    return math.floor(price / tick + 1e-9) * tick
 
 
 class Executor:
-    def __init__(self, host: str, dry_run: bool) -> None:
+    def __init__(self, host: str, dry_run: bool, *, private_key: str = "", funder: str = "", signature_type: int = 1) -> None:
         self.host = host
         self.dry_run = dry_run
+        self.private_key = private_key or os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+        self.funder = funder or os.environ.get("POLYMARKET_FUNDER", "").strip()
+        self.signature_type = signature_type
         self._client = None
 
-    def buy_market(self, token_id: str, amount_usdc: float) -> dict[str, Any]:
+    def ensure_ready(self) -> None:
+        """Authenticate up front so bad credentials fail at startup, not on the first trade."""
+        if not self.dry_run:
+            self._authenticated_client()
+
+    def buy_market(self, token_id: str, amount_usdc: float, max_price: float | None = None) -> OrderResult:
         if self.dry_run:
-            return {"dry_run": True, "token_id": token_id, "amount_usdc": amount_usdc}
+            raw = {"dry_run": True, "token_id": token_id, "amount_usdc": amount_usdc, "max_price": max_price}
+            return OrderResult(True, None, amount_usdc, raw)
 
         client = self._authenticated_client()
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
 
-        order = MarketOrderArgs(token_id=token_id, amount=amount_usdc, side=BUY, order_type=OrderType.FOK)
+        # A positive price caps the worst fill; without it the client sweeps the book at any price.
+        price = floor_to_tick(max_price) if max_price is not None else 0.0
+        if max_price is not None and price <= 0:
+            return OrderResult(False, None, None, None, f"limit price {max_price:.4f} rounds to zero")
+        order = MarketOrderArgs(token_id=token_id, amount=amount_usdc, side=BUY, price=price, order_type=OrderType.FOK)
         signed = client.create_market_order(order)
-        return client.post_order(signed, OrderType.FOK)
+        return parse_order_response(client.post_order(signed, OrderType.FOK))
 
     def _authenticated_client(self):
         if self._client is not None:
             return self._client
 
-        key = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
-        funder = os.environ.get("POLYMARKET_FUNDER", "").strip()
-        signature_type = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "1"))
-        if not key:
+        if not self.private_key:
             raise RuntimeError("POLYMARKET_PRIVATE_KEY is required when dry-run is disabled")
 
         from py_clob_client.client import ClobClient
 
-        self._client = ClobClient(
+        client = ClobClient(
             self.host,
-            key=key,
+            key=self.private_key,
             chain_id=137,
-            signature_type=signature_type,
-            funder=funder or None,
+            signature_type=self.signature_type,
+            funder=self.funder or None,
         )
-        self._client.set_api_creds(self._client.create_or_derive_api_creds())
+        client.set_api_creds(client.create_or_derive_api_creds())
+        self._client = client
         return self._client
 
 
@@ -269,6 +413,21 @@ def parse_event_markets(event: dict[str, Any], require_strict_match: bool) -> li
         if market and market_matches_btc_5m(market, require_strict_match):
             found.append(market)
     return found
+
+
+def parse_resolution(item: dict[str, Any]) -> str | None:
+    if not item.get("closed"):
+        return None
+    outcomes = decode_maybe_json(item.get("outcomes") or [])
+    prices = decode_maybe_json(item.get("outcomePrices") or [])
+    for name, price in zip(outcomes, prices):
+        if to_float(price) >= 0.99:
+            label = str(name).strip().lower()
+            if label in {"up", "yes"}:
+                return "UP"
+            if label in {"down", "no"}:
+                return "DOWN"
+    return None
 
 
 def parse_tokens(item: dict[str, Any]) -> list[OutcomeToken]:
@@ -329,10 +488,11 @@ def infer_start_ts(item: dict[str, Any], end_ts: float) -> float | None:
         if part.isdigit() and len(part) == 10:
             return float(part)
 
-    explicit = parse_ts(first_present(item, "startDate", "start_date", "startDateIso", "start_date_iso"))
+    # startDate is when the market was listed (often a day early), not when the window opens.
+    explicit = parse_ts(first_present(item, "eventStartTime", "event_start_time"))
     if explicit:
         return explicit
-    return end_ts - 300
+    return end_ts - WINDOW_SECONDS
 
 
 def is_btc_5m_market(market: Market) -> bool:

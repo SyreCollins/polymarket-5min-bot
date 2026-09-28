@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from dataclasses import dataclass, field
-from math import erf, exp, log, sqrt
+from datetime import datetime, timezone
+from math import erf, exp, isfinite, log, sqrt
 from pathlib import Path
 from statistics import pstdev
 from time import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+
+
+# Passed as a fill price when the order book cannot absorb the whole stake.
+UNFILLABLE = float("inf")
 
 
 @dataclass(frozen=True)
@@ -18,17 +24,15 @@ class RiskConfig:
     max_seconds_left: float = 45.0
     min_market_volume: float = 1000.0
     max_buy_price: float = 0.92
-    max_trade_size: float = 5.0
-    bankroll_fraction: float = 0.01
     max_daily_loss: float = 50.0
     max_position_size: float = 25.0
     max_consecutive_losses: int = 3
     max_trades_per_hour: int = 10
     min_liquidity: float = 1000.0
     max_spread: float = 0.08
-    min_time_remaining: float = 30.0
-    max_time_remaining: float = 300.0
     min_edge_after_costs: float = 0.08
+    # Per-share buffer for taker fees and slippage, in probability units.
+    execution_cost: float = 0.0
     kill_switch: bool = False
     max_open_positions: int = 2
     min_probability: float = 0.01
@@ -45,6 +49,11 @@ class Signal:
     ask_price: float
     edge: float
     reason: str
+    probability_up: float | None = None
+    fill_price: float | None = None
+    edge_after_costs: float | None = None
+    # Worst price the order may fill at while still clearing the after-cost edge threshold.
+    limit_price: float | None = None
 
 
 class FeatureEngine:
@@ -77,7 +86,7 @@ class FeatureEngine:
         sample_end = current_timestamp if current_timestamp is not None else (samples[-1][0] if samples else None)
         btc_1m_return = self._elapsed_return(samples, sample_end, 60.0)
         btc_30s_return = self._elapsed_return(samples, sample_end, 30.0)
-        history_span = max(0.0, sample_end - samples[0][0]) if samples and sample_end is not None else 0.0
+        history_span = price_history_span(samples, sample_end)
 
         if vwap is None:
             vwap = open_price
@@ -130,6 +139,12 @@ class FeatureEngine:
 
 
 class ProbabilityModel:
+    """Logistic score over engineered features.
+
+    The default weights are unfitted placeholders: raw returns are ~1e-3, so the output stays
+    within a hair of 0.5. It is kept for research only; build_signal uses the Brownian model.
+    """
+
     def __init__(self, weights: dict[str, float] | None = None, min_probability: float = 0.01, max_probability: float = 0.99):
         self.weights = {
             "btc_5m_return": 0.35,
@@ -198,8 +213,8 @@ class TradeLogger:
         order_flow_features: dict[str, float],
         polymarket_bid: float,
         polymarket_ask: float,
-        model_probability_up: float,
-        model_probability_down: float,
+        model_probability_up: float | None,
+        model_probability_down: float | None,
         estimated_edge: float,
         trade_decision: str,
         decision_reason: str,
@@ -225,8 +240,14 @@ class TradeLogger:
             "decision_reason": decision_reason,
             "position_size": position_size,
         }
+        self._append(record)
+
+    def record_event(self, event: str, **fields: Any) -> None:
+        self._append({"event": event, "logged_at": time(), **fields})
+
+    def _append(self, record: dict[str, Any]) -> None:
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+            handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
 
 
 @dataclass
@@ -237,8 +258,16 @@ class PaperTrade:
     stake: float
     model_probability: float
     edge: float
+    shares: float | None = None
+    end_ts: float | None = None
     resolved_outcome: str | None = None
     pnl: float | None = None
+
+    @property
+    def share_count(self) -> float:
+        if self.shares is not None:
+            return self.shares
+        return self.stake / self.entry_price if self.entry_price > 0 else 0.0
 
 
 class PaperTradeLedger:
@@ -254,6 +283,8 @@ class PaperTradeLedger:
         stake: float,
         model_probability: float,
         edge: float,
+        shares: float | None = None,
+        end_ts: float | None = None,
     ) -> PaperTrade:
         trade = PaperTrade(
             market_id=market_id,
@@ -262,6 +293,8 @@ class PaperTradeLedger:
             stake=stake,
             model_probability=model_probability,
             edge=edge,
+            shares=shares,
+            end_ts=end_ts,
         )
         self.trades.append(trade)
         return trade
@@ -280,10 +313,12 @@ class PaperTradeLedger:
             return None
 
         trade.resolved_outcome = normalized_outcome
-        shares = trade.stake / trade.entry_price if trade.entry_price > 0 else 0.0
-        payout = shares if trade.outcome == normalized_outcome else 0.0
+        payout = trade.share_count if trade.outcome == normalized_outcome else 0.0
         trade.pnl = payout - trade.stake
         return trade
+
+    def open_trades(self) -> list[PaperTrade]:
+        return [trade for trade in self.trades if trade.resolved_outcome is None]
 
     def summary(self) -> dict[str, float]:
         resolved = [trade for trade in self.trades if trade.pnl is not None]
@@ -312,47 +347,74 @@ class PaperTradeLedger:
 @dataclass
 class RiskManager:
     risk: RiskConfig = field(default_factory=RiskConfig)
-    daily_loss: float = 0.0
+    clock: Callable[[], float] = time
+    daily_pnl: float = 0.0
     trades_today: int = 0
-    trades_last_hour: int = 0
     open_positions: int = 0
     consecutive_losses: int = 0
-    last_hour_window: float = field(default_factory=time)
+    _entry_times: deque[float] = field(default_factory=deque, repr=False)
+    _day: str | None = field(default=None, repr=False)
+
+    @property
+    def daily_loss(self) -> float:
+        self._roll_day()
+        return max(0.0, -self.daily_pnl)
+
+    @property
+    def trades_last_hour(self) -> int:
+        cutoff = self.clock() - 3600.0
+        while self._entry_times and self._entry_times[0] <= cutoff:
+            self._entry_times.popleft()
+        return len(self._entry_times)
+
+    def block_reason(self, *, spread: float | None = None, liquidity: float | None = None) -> str | None:
+        self._roll_day()
+        if self.risk.kill_switch:
+            return "kill switch enabled"
+        if self.daily_loss >= self.risk.max_daily_loss:
+            return f"daily loss limit reached ({self.daily_loss:.2f})"
+        if self.trades_today >= self.risk.max_trades_per_day:
+            return "daily trade limit reached"
+        if self.trades_last_hour >= self.risk.max_trades_per_hour:
+            return "hourly trade limit reached"
+        if self.open_positions >= self.risk.max_open_positions:
+            return "max open positions reached"
+        if self.consecutive_losses >= self.risk.max_consecutive_losses:
+            return f"{self.consecutive_losses} consecutive losses; paused until next UTC day"
+        if spread is not None and spread > self.risk.max_spread:
+            return f"spread {spread:.3f} above max"
+        if liquidity is not None and liquidity < self.risk.min_liquidity:
+            return "market liquidity below threshold"
+        return None
 
     def can_trade(self, market_id: str | None = None, *, spread: float | None = None, liquidity: float | None = None) -> bool:
-        if self.risk.kill_switch:
-            return False
-        if self.daily_loss >= self.risk.max_daily_loss:
-            return False
-        if self.trades_today >= self.risk.max_trades_per_day:
-            return False
-        if self.open_positions >= self.risk.max_open_positions:
-            return False
-        if self.consecutive_losses >= self.risk.max_consecutive_losses:
-            return False
-        if self.trades_last_hour >= self.risk.max_trades_per_hour:
-            return False
-        if spread is not None and spread > self.risk.max_spread:
-            return False
-        if liquidity is not None and liquidity < self.risk.min_liquidity:
-            return False
-        return True
+        return self.block_reason(spread=spread, liquidity=liquidity) is None
+
+    def record_entry(self) -> None:
+        self._roll_day()
+        self.trades_today += 1
+        self.open_positions += 1
+        self._entry_times.append(self.clock())
+
+    def record_result(self, pnl: float) -> None:
+        self._roll_day()
+        self.open_positions = max(0, self.open_positions - 1)
+        self.daily_pnl += float(pnl)
+        self.consecutive_losses = self.consecutive_losses + 1 if pnl < 0 else 0
 
     def record_trade(self, trade_size: float, outcome: str, entry_price: float, exit_price: float, pnl: float | None = None) -> None:
-        self.trades_today += 1
-        self.trades_last_hour += 1
-        loss_amount = abs(float(trade_size)) if trade_size else (abs(float(pnl)) if pnl is not None else 0.0)
+        """Record an entry, and its result too when pnl is known."""
+        self.record_entry()
         if pnl is not None:
-            loss_amount = abs(float(pnl)) if float(pnl) < 0 else 0.0
-        self.daily_loss += loss_amount
-        if pnl is not None and float(pnl) < 0:
-            self.consecutive_losses += 1
-        else:
-            self.consecutive_losses = 0
+            self.record_result(pnl)
 
-    def reset_hourly_window(self) -> None:
-        self.trades_last_hour = 0
-        self.last_hour_window = time()
+    def _roll_day(self) -> None:
+        today = datetime.fromtimestamp(self.clock(), tz=timezone.utc).date().isoformat()
+        if today != self._day:
+            self._day = today
+            self.daily_pnl = 0.0
+            self.trades_today = 0
+            self.consecutive_losses = 0
 
 
 def normal_cdf(x: float) -> float:
@@ -374,18 +436,66 @@ def realized_volatility(prices: Iterable[float], fallback_per_second: float = 0.
     return max(pstdev(returns), fallback_per_second)
 
 
+def per_second_volatility(
+    samples: Iterable[tuple[float, float]],
+    *,
+    end_timestamp: float | None = None,
+    lookback_seconds: float = 300.0,
+    min_returns: int = 30,
+    floor: float = 0.00008,
+) -> float:
+    """Realized volatility of 1-second log returns.
+
+    Tick-to-tick returns are not per-second returns (feeds tick anywhere from ~1 to ~50 times a
+    second), so samples are resampled onto a 1-second grid with forward fill first.
+    """
+    points = sorted((float(ts), float(price)) for ts, price in samples if price > 0)
+    if len(points) < 2:
+        return floor
+    end = points[-1][0] if end_timestamp is None else end_timestamp
+    start = end - lookback_seconds
+    last_by_second: dict[int, float] = {}
+    for ts, price in points:
+        if start <= ts <= end:
+            last_by_second[int(ts)] = price
+    if len(last_by_second) < 2:
+        return floor
+
+    seconds = sorted(last_by_second)
+    previous = last_by_second[seconds[0]]
+    squared_sum = 0.0
+    count = 0
+    for second in range(seconds[0] + 1, seconds[-1] + 1):
+        current = last_by_second.get(second, previous)
+        squared_sum += log(current / previous) ** 2
+        count += 1
+        previous = current
+    if count < min_returns:
+        return floor
+    return max(sqrt(squared_sum / count), floor)
+
+
+def price_history_span(samples: list[tuple[float, float]], end_timestamp: float | None) -> float:
+    if not samples or end_timestamp is None:
+        return 0.0
+    return max(0.0, end_timestamp - samples[0][0])
+
+
 def probability_up(
     open_price: float,
     current_price: float,
     seconds_left: float,
-    recent_prices: Iterable[float],
+    recent_prices: Iterable[float] = (),
+    sigma: float | None = None,
 ) -> float:
+    """P(price at expiry >= open) under driftless Brownian motion with per-second volatility sigma."""
     if open_price <= 0 or current_price <= 0:
         return 0.5
     if seconds_left <= 0:
         return 1.0 if current_price >= open_price else 0.0
 
-    sigma = realized_volatility(recent_prices)
+    if sigma is None:
+        sigma = realized_volatility(recent_prices)
     distance = log(open_price / current_price)
     denom = sigma * sqrt(max(seconds_left, 1.0))
     if denom <= 0:
@@ -409,7 +519,14 @@ def build_signal(
     market_volume: float,
     trades_today: int,
     risk: RiskConfig,
+    up_fill_price: float | None = None,
+    down_fill_price: float | None = None,
 ) -> Signal:
+    """Pick the side with the best edge, if any clears every gate.
+
+    up_ask/down_ask are best asks; *_fill_price are average fill prices for the full stake
+    (defaulting to the best ask, or UNFILLABLE when the book is too thin).
+    """
     if trades_today >= risk.max_trades_per_day:
         return _skip("UP", up_token_id, "daily trade limit reached")
 
@@ -419,47 +536,71 @@ def build_signal(
     if seconds_left < risk.min_seconds_left or seconds_left > risk.max_seconds_left:
         return _skip("UP", up_token_id, "outside execution window")
 
-    samples = list(recent_samples)
-    features = FeatureEngine().compute_features(
-        open_price=open_price,
-        current_price=current_price,
-        recent_prices=recent_prices,
-        recent_samples=samples,
-        current_timestamp=current_timestamp,
-        seconds_left=seconds_left,
-        market_volume=market_volume,
-        up_ask=up_ask,
-        down_ask=down_ask,
-    )
-    if features["price_history_seconds"] < risk.min_price_history_seconds:
+    samples = sorted((float(ts), float(price)) for ts, price in recent_samples if ts is not None and price > 0)
+    sample_end = current_timestamp if current_timestamp is not None else (samples[-1][0] if samples else None)
+    if price_history_span(samples, sample_end) < risk.min_price_history_seconds:
         return _skip("UP", up_token_id, "insufficient BTC price history")
 
-    up_probability = ProbabilityModel(min_probability=risk.min_probability, max_probability=risk.max_probability).estimate_probability(features)
+    sigma = per_second_volatility(samples, end_timestamp=sample_end)
+    up_probability = probability_up(open_price, current_price, seconds_left, sigma=sigma)
+    up_probability = min(max(up_probability, risk.min_probability), risk.max_probability)
     candidates: list[Signal] = []
 
     if up_ask is not None:
-        candidates.append(_candidate("UP", up_token_id, up_probability, up_ask, risk))
+        candidates.append(_candidate("UP", up_token_id, up_probability, up_ask, up_fill_price, up_probability, risk))
     if down_ask is not None:
-        candidates.append(_candidate("DOWN", down_token_id, 1.0 - up_probability, down_ask, risk))
+        candidates.append(_candidate("DOWN", down_token_id, 1.0 - up_probability, down_ask, down_fill_price, up_probability, risk))
 
     tradable = [candidate for candidate in candidates if candidate.should_trade]
-    if not tradable:
-        best = max(candidates, key=lambda item: item.edge, default=None)
-        if best:
-            return Signal(False, best.outcome, best.token_id, best.model_probability, best.ask_price, best.edge, best.reason)
-        return _skip("UP", up_token_id, "missing CLOB ask prices")
+    if tradable:
+        return max(tradable, key=lambda item: item.edge)
+    best = max(candidates, key=lambda item: item.edge, default=None)
+    if best:
+        return best
+    return _skip("UP", up_token_id, "missing CLOB ask prices", probability_up=up_probability)
 
-    return max(tradable, key=lambda item: item.edge)
 
-
-def _candidate(outcome: str, token_id: str, probability: float, ask: float, risk: RiskConfig) -> Signal:
+def _candidate(
+    outcome: str,
+    token_id: str,
+    probability: float,
+    ask: float,
+    fill_price: float | None,
+    up_probability: float,
+    risk: RiskConfig,
+) -> Signal:
+    fill = ask if fill_price is None else fill_price
     edge = probability - ask
+    edge_after_costs = probability - fill - risk.execution_cost if isfinite(fill) else None
+    limit_price = min(risk.max_buy_price, probability - risk.execution_cost - risk.min_edge_after_costs)
+
+    def result(should_trade: bool, reason: str) -> Signal:
+        return Signal(
+            should_trade,
+            outcome,
+            token_id,
+            probability,
+            ask,
+            edge,
+            reason,
+            probability_up=up_probability,
+            fill_price=fill if isfinite(fill) else None,
+            edge_after_costs=edge_after_costs,
+            limit_price=limit_price if should_trade else None,
+        )
+
     if ask > risk.max_buy_price:
-        return Signal(False, outcome, token_id, probability, ask, edge, "ask above max buy price")
+        return result(False, "ask above max buy price")
     if edge < risk.min_edge:
-        return Signal(False, outcome, token_id, probability, ask, edge, "edge below threshold")
-    return Signal(True, outcome, token_id, probability, ask, edge, "edge threshold met")
+        return result(False, "edge below threshold")
+    if edge_after_costs is None:
+        return result(False, "order book too thin for stake")
+    if edge_after_costs < risk.min_edge_after_costs:
+        return result(False, "edge after costs below threshold")
+    if limit_price < fill:
+        return result(False, "limit price below expected fill")
+    return result(True, "edge threshold met")
 
 
-def _skip(outcome: str, token_id: str, reason: str) -> Signal:
-    return Signal(False, outcome, token_id, 0.0, 0.0, 0.0, reason)
+def _skip(outcome: str, token_id: str, reason: str, probability_up: float | None = None) -> Signal:
+    return Signal(False, outcome, token_id, 0.0, 0.0, 0.0, reason, probability_up=probability_up)

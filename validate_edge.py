@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import ssl
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from polymarket_client import GammaClient, Market
+from polymarket_client import GammaClient, Market, default_ssl_context, parse_resolution
 
 
-NETWORK_CONTEXT = ssl._create_unverified_context()
+NETWORK_CONTEXT = default_ssl_context()
 GAMMA_URL = "https://gamma-api.polymarket.com"
 DISPLAY_TZ = ZoneInfo("America/New_York")
 
@@ -62,30 +61,8 @@ def fetch_market(market_id: str) -> dict:
 
 
 def official_winner(final_market: dict) -> str | None:
-    for key in ("outcome", "resolvedOutcome", "winningOutcome"):
-        value = final_market.get(key)
-        if value in ("0", 0, "Up", "UP", "Yes", "YES"):
-            return "UP"
-        if value in ("1", 1, "Down", "DOWN", "No", "NO"):
-            return "DOWN"
-
-    outcomes = final_market.get("outcomes")
-    prices = final_market.get("outcomePrices")
-    if isinstance(outcomes, str):
-        try:
-            outcomes = json.loads(outcomes)
-        except json.JSONDecodeError:
-            outcomes = None
-    if isinstance(prices, str):
-        try:
-            prices = json.loads(prices)
-        except json.JSONDecodeError:
-            prices = None
-    if isinstance(outcomes, list) and isinstance(prices, list):
-        numeric = [float(price) for price in prices]
-        if numeric:
-            return str(outcomes[numeric.index(max(numeric))]).upper()
-    return None
+    # Only a closed market with a settled price is a result; live prices near 0/1 are not.
+    return parse_resolution(final_market)
 
 
 def choose_current_market(markets: list[Market]) -> Market | None:
