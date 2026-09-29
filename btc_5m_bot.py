@@ -44,7 +44,10 @@ TELEGRAM_HEARTBEAT_SECONDS = 60 * 60
 
 
 def check_geoblock() -> tuple[bool, str]:
-    request = urllib.request.Request(GEOBLOCK_URL, headers={"accept": "application/json"})
+    request = urllib.request.Request(GEOBLOCK_URL, headers={
+        "accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    })
     with urllib.request.urlopen(request, timeout=10) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not isinstance(payload, dict) or not isinstance(payload.get("blocked"), bool):
