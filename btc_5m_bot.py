@@ -740,7 +740,12 @@ class TradingBot:
         return self.open_prices[key]
 
     async def execute(self, market: Market, signal: Signal, quote: BookQuote | None, stake: float) -> None:
-        spread = quote.spread if quote and quote.spread is not None else float("inf")
+        if quote and quote.best_ask is not None and quote.best_bid is None:
+            spread = None
+        elif quote and quote.spread is not None:
+            spread = quote.spread
+        else:
+            spread = float("inf")
         blocked = self.risk_manager.block_reason(spread=spread, liquidity=market.liquidity)
         if blocked:
             log.info("[risk] skipping %s %s: %s", market.slug or market.id, signal.outcome, blocked)
