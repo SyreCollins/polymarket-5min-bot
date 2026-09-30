@@ -8,7 +8,7 @@ import signal
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from math import isfinite
+from math import isfinite, log, sqrt
 from statistics import median
 from time import monotonic, time
 from typing import Callable
@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from polymarket_client import WINDOW_SECONDS, BookQuote, ClobMarketData, Executor, GammaClient, Market
 from settings import ConfigError, Settings
-from strategy import UNFILLABLE, FeatureEngine, PaperTradeLedger, RiskManager, Signal, TradeLogger, build_signal
+from strategy import UNFILLABLE, DecisionLogger, FeatureEngine, PaperTradeLedger, RiskManager, Signal, TradeLogger, build_signal, per_second_volatility, probability_up
 
 
 log = logging.getLogger("btc_5m_bot")
@@ -459,6 +459,7 @@ class TradingBot:
             signature_type=settings.signature_type,
         )
         self.logger = logger or TradeLogger(settings.trade_log_path)
+        self.decision_logger = DecisionLogger(settings.trade_log_path.replace("trade_log", "decision_log"))
         self.risk_manager = RiskManager(settings.risk, clock=clock, state_path=settings.risk_state_path)
         self.ledger = PaperTradeLedger()
         self.feature_engine = FeatureEngine()
@@ -664,6 +665,32 @@ class TradingBot:
             trades_today=self.risk_manager.trades_today,
             risk=self.settings.risk,
         )
+
+        # Log decision cycle for calibration (only within execution window)
+        if (self.settings.risk.min_seconds_left <= seconds_left <= self.settings.risk.max_seconds_left
+                and signal.probability_up is not None):
+            sigma = per_second_volatility(
+                sorted((float(ts), float(price)) for ts, price in samples if ts is not None and price > 0),
+                end_timestamp=current_sample_timestamp,
+            )
+            z_score = 0.0
+            if sigma > 0 and seconds_left > 0:
+                z_score = log(open_price / btc.price) / (sigma * sqrt(seconds_left))
+            trade_outcome = signal.outcome if signal.should_trade else None
+            self.decision_logger.record_decision(
+                timestamp=datetime.now(DISPLAY_TZ).isoformat(),
+                market_id=market.id,
+                market_slug=market.slug or market.event_slug,
+                seconds_left=seconds_left,
+                open_price=open_price,
+                current_price=btc.price,
+                sigma=sigma,
+                z_score=z_score,
+                model_probability_up=signal.probability_up,
+                trade_decision="TRADE" if signal.should_trade else "NO_TRADE",
+                trade_outcome=trade_outcome,
+            )
+
         side_quote = up_quote if signal.outcome == "UP" else down_quote
         self.log_decision(market, signal, btc.price, open_price, samples, current_sample_timestamp,
                           seconds_left, activity_measure, up_ask, down_ask, side_quote)

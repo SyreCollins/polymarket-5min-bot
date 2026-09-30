@@ -193,6 +193,50 @@ class EdgeCalculator:
 
 
 @dataclass
+class DecisionLogger:
+    """Logs every decision cycle within the execution window for calibration analysis."""
+    path: Path | str = "decision_log.jsonl"
+
+    def __post_init__(self) -> None:
+        self.path = Path(self.path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def record_decision(
+        self,
+        *,
+        timestamp: str,
+        market_id: str,
+        market_slug: str,
+        seconds_left: float,
+        open_price: float,
+        current_price: float,
+        sigma: float,
+        z_score: float,
+        model_probability_up: float,
+        trade_decision: str,
+        trade_outcome: str | None,
+    ) -> None:
+        record = {
+            "timestamp": timestamp,
+            "market_id": market_id,
+            "market_slug": market_slug,
+            "seconds_left": seconds_left,
+            "open_price": open_price,
+            "current_price": current_price,
+            "sigma": sigma,
+            "z_score": z_score,
+            "model_probability_up": model_probability_up,
+            "trade_decision": trade_decision,  # "TRADE" or "NO_TRADE"
+            "trade_outcome": trade_outcome,    # "UP", "DOWN", or None
+        }
+        self._append(record)
+
+    def _append(self, record: dict[str, Any]) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+
+
+@dataclass
 class TradeLogger:
     path: Path | str = "trade_log.jsonl"
 
