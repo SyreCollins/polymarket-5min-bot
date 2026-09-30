@@ -8,7 +8,7 @@ import signal
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from math import isfinite, log, sqrt
+from math import isfinite, log as ln, sqrt
 from statistics import median
 from time import monotonic, time
 from typing import Callable
@@ -675,7 +675,7 @@ class TradingBot:
             )
             z_score = 0.0
             if sigma > 0 and seconds_left > 0:
-                z_score = log(open_price / btc.price) / (sigma * sqrt(seconds_left))
+                z_score = ln(open_price / btc.price) / (sigma * sqrt(seconds_left))
             trade_outcome = signal.outcome if signal.should_trade else None
             self.decision_logger.record_decision(
                 timestamp=datetime.now(DISPLAY_TZ).isoformat(),
