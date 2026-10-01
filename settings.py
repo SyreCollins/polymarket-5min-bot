@@ -101,6 +101,7 @@ class Settings:
             max_trades_per_day=e.int("MAX_TRADES_PER_DAY", 20),
             max_trades_per_hour=e.int("MAX_TRADES_PER_HOUR", 10),
             min_edge=e.float("MIN_EDGE", 0.07),
+            max_edge=e.float("MAX_EDGE", 0.25),
             min_edge_after_costs=e.float("MIN_EDGE_AFTER_COSTS", 0.08),
             execution_cost=e.float("EXECUTION_COST", 0.02),
             min_seconds_left=e.float("MIN_SECONDS_LEFT", 8.0),
@@ -158,6 +159,8 @@ class Settings:
             errors.append("MAX_BUY_PRICE must be between 0 and 1")
         if r.min_seconds_left < 0 or r.min_seconds_left >= r.max_seconds_left:
             errors.append("MIN_SECONDS_LEFT must be >= 0 and below MAX_SECONDS_LEFT")
+        if r.min_edge < 0 or r.min_edge >= r.max_edge:
+            errors.append("MIN_EDGE must be >= 0 and below MAX_EDGE")
         if r.execution_cost < 0:
             errors.append("EXECUTION_COST must be >= 0")
         if self.poll_seconds <= 0:

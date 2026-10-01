@@ -22,6 +22,7 @@ class RiskConfig:
     trade_usdc: float = 5.0
     max_trades_per_day: int = 20
     min_edge: float = 0.07
+    max_edge: float = 0.25
     min_seconds_left: float = 8.0
     max_seconds_left: float = 45.0
     min_market_volume: float = 1000.0
@@ -767,6 +768,8 @@ def _candidate(
         return result(False, "ask above max buy price")
     if edge < risk.min_edge:
         return result(False, "edge below threshold")
+    if edge > risk.max_edge:
+        return result(False, "edge above maximum threshold")
     if edge_after_costs is None:
         return result(False, "order book too thin for stake")
     if edge_after_costs < risk.min_edge_after_costs:
