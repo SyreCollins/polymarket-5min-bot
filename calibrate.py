@@ -14,6 +14,7 @@ import math
 import sys
 import urllib.parse
 import urllib.request
+import gzip
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,6 +41,10 @@ class Decision:
     seconds_left: float
     open_price: float
     current_price: float
+    model_open_price: float | None
+    model_current_price: float | None
+    twap_open_price: float | None
+    twap_current_price: float | None
     sigma: float
     z_score: float
     model_probability_up: float
@@ -50,10 +55,13 @@ class Decision:
 def fetch_json(url: str) -> Any:
     request = urllib.request.Request(
         url,
-        headers={"accept": "application/json", "user-agent": "calibrate/0.1"},
+        headers={"accept": "application/json", "user-agent": "calibrate/0.1", "Accept-Encoding": "gzip, deflate"},
     )
     with urllib.request.urlopen(request, timeout=15, context=SSL_CTX) as response:
-        return json.loads(response.read().decode("utf-8"))
+        content = response.read()
+        if response.headers.get("Content-Encoding") == "gzip":
+            content = gzip.decompress(content)
+        return json.loads(content.decode("utf-8"))
 
 
 def fetch_resolution(market_id: str) -> str | None:
@@ -114,6 +122,10 @@ def parse_decision_log(path: Path) -> list[Decision]:
                 seconds_left=float(record.get("seconds_left", 0.0)),
                 open_price=float(record.get("open_price", 0.0)),
                 current_price=float(record.get("current_price", 0.0)),
+                model_open_price=record.get("model_open_price"),
+                model_current_price=record.get("model_current_price"),
+                twap_open_price=record.get("twap_open_price"),
+                twap_current_price=record.get("twap_current_price"),
                 sigma=float(record.get("sigma", 0.0)),
                 z_score=float(record.get("z_score", 0.0)),
                 model_probability_up=float(prob_up),

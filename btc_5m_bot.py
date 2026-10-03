@@ -69,8 +69,12 @@ def send_telegram_alert(message: str) -> bool:
         with urllib.request.urlopen(request, timeout=8) as response:
             result = json.loads(response.read().decode("utf-8"))
         return isinstance(result, dict) and result.get("ok") is True
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        log.warning("[telegram] alert delivery failed: HTTP %s - %s", exc.code, error_body)
+        return False
     except Exception as exc:
-        log.warning("[telegram] alert delivery failed (%s)", type(exc).__name__)
+        log.warning("[telegram] alert delivery failed (%s): %s", type(exc).__name__, exc)
         return False
 
 
@@ -115,6 +119,9 @@ class BTCStateSnapshot:
     primary_source: str | None = None
 
 
+TWAP_WINDOW_SECONDS = 60.0
+
+
 @dataclass
 class PriceState:
     max_age_seconds: float = 10.0
@@ -130,6 +137,9 @@ class PriceState:
     last_update_timestamp: dict[str, float] = field(default_factory=dict)
     _last_state_signature: tuple[str, ...] | None = field(default=None, repr=False)
     _last_status: str | None = field(default=None, repr=False)
+    # 60-second TWAP tracking for primary source (used for calibration/probability model)
+    twap_samples: deque[tuple[float, float]] = field(default_factory=deque)  # (timestamp, price)
+    _twap_primary_source: str | None = field(default=None, repr=False)
 
     @property
     def current(self) -> float | None:
@@ -149,12 +159,67 @@ class PriceState:
         snapshot = self.get_current_btc_state(now=received_at)
         if snapshot.status == "OK" and snapshot.price is not None:
             self._append(self.history, received_at, snapshot.price)
+            # Update TWAP samples if this is the primary source
+            if snapshot.primary_source == source:
+                self._update_twap(source, snapshot.price, received_at)
 
     def _append(self, history: deque[tuple[float, float]], timestamp: float, price: float) -> None:
         history.append((timestamp, price))
         cutoff = timestamp - self.history_retention_seconds
         while history and history[0][0] < cutoff:
             history.popleft()
+
+    def _update_twap(self, source: str, price: float, received_at: float) -> None:
+        """Update 60-second TWAP samples for the primary source."""
+        if self._twap_primary_source is None:
+            self._twap_primary_source = source
+        if source != self._twap_primary_source:
+            return
+        # Append new sample
+        self.twap_samples.append((received_at, price))
+        # Remove samples older than TWAP_WINDOW_SECONDS
+        cutoff = received_at - TWAP_WINDOW_SECONDS
+        while self.twap_samples and self.twap_samples[0][0] < cutoff:
+            self.twap_samples.popleft()
+
+    def get_twap(self) -> float | None:
+        """Return current 60-second TWAP for primary source, or None if insufficient data."""
+        if len(self.twap_samples) < 2:
+            return None
+        total_weight = 0.0
+        weighted_sum = 0.0
+        # Time-weighted average: sum(price_i * dt_i) / sum(dt_i)
+        for i in range(1, len(self.twap_samples)):
+            dt = self.twap_samples[i][0] - self.twap_samples[i-1][0]
+            if dt > 0:
+                total_weight += dt
+                weighted_sum += self.twap_samples[i][1] * dt
+        if total_weight <= 0:
+            return None
+        return weighted_sum / total_weight
+
+    def get_twap_at(self, timestamp: float) -> float | None:
+        """Return 60-second TWAP ending at the given timestamp, using historical samples.
+        Returns None if insufficient data in [timestamp-60, timestamp]."""
+        if not self.history:
+            return None
+        window_start = timestamp - TWAP_WINDOW_SECONDS
+        window_end = timestamp
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for i in range(1, len(self.history)):
+            ts, price = self.history[i]
+            if ts > window_end:
+                break
+            if ts < window_start:
+                continue
+            dt = ts - self.history[i-1][0]
+            if dt > 0:
+                total_weight += dt
+                weighted_sum += price * dt
+        if total_weight <= 0:
+            return None
+        return weighted_sum / total_weight
 
     def samples(self, source: str | None = None) -> list[tuple[float, float]]:
         return list(self.history if source is None else self.source_history.get(source, ()))
@@ -176,6 +241,11 @@ class PriceState:
         if not candidates:
             return None
         return min(candidates, key=lambda sample: abs(sample[0] - start_timestamp))[1]
+
+    def market_open_twap(self, start_timestamp: float) -> float | None:
+        """60-second TWAP at the window start (ending at start_timestamp).
+        Returns the TWAP for [start_timestamp-60, start_timestamp], or None if insufficient data."""
+        return self.get_twap_at(start_timestamp)
 
     def set_connected(self, source: str, connected: bool, detail: str = "") -> None:
         was_connected = self.connections.get(source, False)
@@ -542,10 +612,18 @@ class TradingBot:
             self.notify(message)
 
     async def telegram_sender_loop(self) -> None:
+        """Send Telegram alerts with rate limiting (Telegram allows ~1 msg/sec per chat)."""
+        last_send = 0.0
+        min_interval = 1.1  # seconds between sends to same chat
         while True:
             message = await self.telegram_outbox.get()
             try:
+                now = monotonic()
+                wait = max(0.0, last_send + min_interval - now)
+                if wait > 0:
+                    await asyncio.sleep(wait)
                 await asyncio.to_thread(send_telegram_alert, message)
+                last_send = monotonic()
             finally:
                 self.telegram_outbox.task_done()
 
@@ -634,6 +712,14 @@ class TradingBot:
                 )
             return
 
+        # Get TWAP prices for probability model
+        twap_open_price = self.state.market_open_twap(start_ts)
+        twap_current_price = self.state.get_twap()
+        
+        # Use TWAP if available, fall back to spot
+        model_open_price = twap_open_price if twap_open_price is not None else open_price
+        model_current_price = twap_current_price if twap_current_price is not None else btc.price
+        
         stake = self.settings.stake_usdc
         up_quote, down_quote = await asyncio.gather(
             asyncio.to_thread(self.clob.quote, market.up.token_id, stake),
@@ -649,8 +735,8 @@ class TradingBot:
         current_sample_timestamp = samples[-1][0] if samples else None
 
         signal = build_signal(
-            open_price=open_price,
-            current_price=btc.price,
+            open_price=model_open_price,
+            current_price=model_current_price,
             seconds_left=seconds_left,
             recent_prices=[price for _, price in samples],
             recent_samples=samples,
@@ -675,7 +761,7 @@ class TradingBot:
             )
             z_score = 0.0
             if sigma > 0 and seconds_left > 0:
-                z_score = ln(open_price / btc.price) / (sigma * sqrt(seconds_left))
+                z_score = ln(model_open_price / model_current_price) / (sigma * sqrt(seconds_left))
             trade_outcome = signal.outcome if signal.should_trade else None
             self.decision_logger.record_decision(
                 timestamp=datetime.now(DISPLAY_TZ).isoformat(),
@@ -684,6 +770,10 @@ class TradingBot:
                 seconds_left=seconds_left,
                 open_price=open_price,
                 current_price=btc.price,
+                model_open_price=model_open_price,
+                model_current_price=model_current_price,
+                twap_open_price=twap_open_price,
+                twap_current_price=twap_current_price,
                 sigma=sigma,
                 z_score=z_score,
                 model_probability_up=signal.probability_up,
