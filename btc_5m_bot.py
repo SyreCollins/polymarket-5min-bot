@@ -9,6 +9,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import isfinite, log as ln, sqrt
+import math
 from statistics import median
 from time import monotonic, time
 from typing import Callable
@@ -246,6 +247,52 @@ class PriceState:
         """60-second TWAP at the window start (ending at start_timestamp).
         Returns the TWAP for [start_timestamp-60, start_timestamp], or None if insufficient data."""
         return self.get_twap_at(start_timestamp)
+
+    def get_twap_sigma(self, end_timestamp: float, lookback_seconds: float = 300.0) -> float | None:
+        """Compute per-second sigma from 60s TWAP series over the lookback window.
+        
+        Args:
+            end_timestamp: End of the lookback window (typically current time or decision time)
+            lookback_seconds: How far back to compute sigma (default 300s = 5 min window)
+        
+        Returns:
+            Per-second sigma of TWAP log returns, or None if insufficient data.
+        """
+        if not self.history:
+            return None
+        
+        window_start = end_timestamp - lookback_seconds
+        window_end = end_timestamp
+        
+        # Build TWAP series at each history point in the window
+        twap_points: list[tuple[float, float]] = []
+        for i in range(1, len(self.history)):
+            ts = self.history[i][0]
+            if ts < window_start + TWAP_WINDOW_SECONDS:
+                continue
+            if ts > window_end:
+                break
+            twap = self.get_twap_at(ts)
+            if twap is not None:
+                twap_points.append((ts, twap))
+        
+        if len(twap_points) < 3:
+            return None
+        
+        # Compute per-second log returns on TWAP
+        returns: list[float] = []
+        for i in range(1, len(twap_points)):
+            dt = twap_points[i][0] - twap_points[i-1][0]
+            if dt > 0:
+                r = math.log(twap_points[i][1] / twap_points[i-1][1]) / dt
+                returns.append(r)
+        
+        if len(returns) < 3:
+            return None
+        
+        mean_r = sum(returns) / len(returns)
+        var = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+        return max(math.sqrt(var), 0.00008)
 
     def set_connected(self, source: str, connected: bool, detail: str = "") -> None:
         was_connected = self.connections.get(source, False)
@@ -755,12 +802,19 @@ class TradingBot:
         # Log decision cycle for calibration (only within execution window)
         if (self.settings.risk.min_seconds_left <= seconds_left <= self.settings.risk.max_seconds_left
                 and signal.probability_up is not None):
-            sigma = per_second_volatility(
-                sorted((float(ts), float(price)) for ts, price in samples if ts is not None and price > 0),
-                end_timestamp=current_sample_timestamp,
-            )
+            # Use TWAP sigma when TWAP prices are available for consistency
+            if twap_open_price is not None and twap_current_price is not None:
+                sigma = self.state.get_twap_sigma(
+                    end_timestamp=current_sample_timestamp or self.clock(),
+                    lookback_seconds=300.0,
+                )
+            else:
+                sigma = per_second_volatility(
+                    sorted((float(ts), float(price)) for ts, price in samples if ts is not None and price > 0),
+                    end_timestamp=current_sample_timestamp,
+                )
             z_score = 0.0
-            if sigma > 0 and seconds_left > 0:
+            if sigma and sigma > 0 and seconds_left > 0:
                 z_score = ln(model_open_price / model_current_price) / (sigma * sqrt(seconds_left))
             trade_outcome = signal.outcome if signal.should_trade else None
             self.decision_logger.record_decision(
