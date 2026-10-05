@@ -767,6 +767,21 @@ class TradingBot:
         model_open_price = twap_open_price if twap_open_price is not None else open_price
         model_current_price = twap_current_price if twap_current_price is not None else btc.price
         
+        # Compute sigma FIRST so both build_signal() and logging use the SAME sigma
+        # (TWAP sigma when TWAP prices are used, spot sigma otherwise)
+        samples = self.state.samples(source)
+        current_sample_timestamp = samples[-1][0] if samples else None
+        if twap_open_price is not None and twap_current_price is not None:
+            sigma = self.state.get_twap_sigma(
+                end_timestamp=current_sample_timestamp or self.clock(),
+                lookback_seconds=300.0,
+            )
+        else:
+            sigma = per_second_volatility(
+                sorted((float(ts), float(price)) for ts, price in samples if ts is not None and price > 0),
+                end_timestamp=current_sample_timestamp,
+            )
+        
         stake = self.settings.stake_usdc
         up_quote, down_quote = await asyncio.gather(
             asyncio.to_thread(self.clob.quote, market.up.token_id, stake),
@@ -778,8 +793,6 @@ class TradingBot:
         up_ask = up_quote.best_ask if up_quote else None
         down_ask = down_quote.best_ask if down_quote else None
         activity_measure = max(market.volume, market.liquidity)
-        samples = self.state.samples(source)
-        current_sample_timestamp = samples[-1][0] if samples else None
 
         signal = build_signal(
             open_price=model_open_price,
@@ -797,22 +810,12 @@ class TradingBot:
             market_volume=activity_measure,
             trades_today=self.risk_manager.trades_today,
             risk=self.settings.risk,
+            sigma=sigma,
         )
 
         # Log decision cycle for calibration (only within execution window)
         if (self.settings.risk.min_seconds_left <= seconds_left <= self.settings.risk.max_seconds_left
                 and signal.probability_up is not None):
-            # Use TWAP sigma when TWAP prices are available for consistency
-            if twap_open_price is not None and twap_current_price is not None:
-                sigma = self.state.get_twap_sigma(
-                    end_timestamp=current_sample_timestamp or self.clock(),
-                    lookback_seconds=300.0,
-                )
-            else:
-                sigma = per_second_volatility(
-                    sorted((float(ts), float(price)) for ts, price in samples if ts is not None and price > 0),
-                    end_timestamp=current_sample_timestamp,
-                )
             z_score = 0.0
             if sigma and sigma > 0 and seconds_left > 0:
                 z_score = ln(model_open_price / model_current_price) / (sigma * sqrt(seconds_left))

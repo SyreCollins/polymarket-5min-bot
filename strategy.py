@@ -704,11 +704,15 @@ def build_signal(
     risk: RiskConfig,
     up_fill_price: float | None = None,
     down_fill_price: float | None = None,
+    sigma: float | None = None,
 ) -> Signal:
     """Pick the side with the best edge, if any clears every gate.
 
     up_ask/down_ask are best asks; *_fill_price are average fill prices for the full stake
     (defaulting to the best ask, or UNFILLABLE when the book is too thin).
+
+    If sigma is provided, it is used directly (e.g., TWAP-based sigma for consistency with TWAP prices).
+    Otherwise, sigma is computed from spot samples.
     """
     if trades_today >= risk.max_trades_per_day:
         return _skip("UP", up_token_id, "daily trade limit reached")
@@ -724,7 +728,8 @@ def build_signal(
     if price_history_span(samples, sample_end) < risk.min_price_history_seconds:
         return _skip("UP", up_token_id, "insufficient BTC price history")
 
-    sigma = per_second_volatility(samples, end_timestamp=sample_end)
+    if sigma is None:
+        sigma = per_second_volatility(samples, end_timestamp=sample_end)
     up_probability = probability_up(open_price, current_price, seconds_left, sigma=sigma)
     up_probability = min(max(up_probability, risk.min_probability), risk.max_probability)
     candidates: list[Signal] = []
